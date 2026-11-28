@@ -152,7 +152,10 @@ def route_to_leaves(state: Dict, X: np.ndarray, node_env) -> Dict[int, np.ndarra
             continue
         if k in splits:
             feature, threshold = splits[k]
-            to_left = X[indices, feature] <= threshold
+            if getattr(node_env, "is_categorical", False):
+                to_left = node_env.goes_left(X[indices, feature], threshold)
+            else:
+                to_left = X[indices, feature] <= threshold
             partitions.append((Tree.left_child_idx(k), indices[to_left]))
             partitions.append((Tree.right_child_idx(k), indices[~to_left]))
         else:

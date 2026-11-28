@@ -1,0 +1,120 @@
+# @package _global_
+# Classification trees with categorical subset splits: x[f] in L, with L built
+# one category at a time. Same setup as discrete_choice_classification_tree.yaml,
+# with the node replaced by DecisionTreeNodeCategoricalSequential. All features
+# must be integer codes 0..k-1;
+# they are not scaled and n_categories is derived from the data.
+#
+# Example (generate the synthetic datasets first):
+#   python tests/data/tree/synthetic_cat/prepare_synthetic_cat.py
+#   python train.py +experiments=tree/categorical_classification_tree \
+#     env.data_path=tests/data/tree/synthetic_cat/cat_single_1.csv
+
+defaults:
+  - override /env: tree/tree
+  - override /gflownet: trajectorybalance
+  - override /loss: trajectorybalance
+  - override /proxy: tree
+  - override /logger: wandb
+  - override /evaluator: tree
+
+device: cpu
+
+# Environment
+env:
+  max_depth: 3
+  data_path: null
+  node_type: categorical_sequential
+  node_kwargs:
+    features: # Derived from the dataset if null
+    n_categories: # Derived from the dataset if null
+
+# Proxy
+proxy:
+  prior_type: node_count
+  beta: 1.0
+  sigma: 0.95
+  phi: 2.0
+  alpha_type: uniform
+  alpha_value: 0.1
+  normalize_likelihood: False
+  reward_function: exponential
+  reward_function_kwargs:
+    beta: 1.0
+    alpha: 1.0
+  reward_min: 0.0
+  do_clip_rewards: False
+
+# Buffer
+buffer:
+  replay_capacity: 100
+  store_log_rewards: True
+  check_diversity: True
+  diversity_check_reward_similarity: -1
+  train: null
+  test: null
+
+# GFlowNet hyperparameters
+gflownet:
+  random_action_prob: 0.1
+  optimizer:
+    batch_size:
+      forward: 90
+      backward_replay: 10
+      backward_dataset: 0
+    lr: 0.01
+    z_dim: 16
+    lr_z_mult: 100
+    n_train_steps: 2000
+    lr_decay_period: 11000
+    lr_decay_gamma: 0.5
+  replay_sampling: weighted
+  train_sampling: permutation
+
+# Policy
+policy:
+  forward:
+    type: mlp
+    n_hid: 256
+    n_layers: 3
+  backward:
+    type: mlp
+    n_hid: 256
+    n_layers: 3
+    shared_weights: False
+
+# Evaluator
+evaluator:
+  first_it: True
+  period: 500
+  checkpoints_period: 500
+  n_trajs_logprobs: 10
+  logprobs_batch_size: 10
+  n: 10
+  n_top_k: 5000
+  top_k: 100
+  top_k_period: -1
+  tree_test:
+    n_samples: 1000
+    top_k_trees: 10
+    alpha_value: 0.1
+    plot_top_k: False
+    seed: null
+
+# WandB
+logger:
+  lightweight: True
+  run_name: null
+  project_name: "dt-gfn_classification"
+  entity: alex-hg
+  tags:
+    - gflownet
+    - tree
+    - categorical
+  do:
+    online: False
+
+# Hydra
+hydra:
+  run:
+    dir: ${user.logdir.root}/tree/${oc.env:SLURM_JOB_ID,local}/${now:%Y-%m-%d_%H-%M-%S_%f}

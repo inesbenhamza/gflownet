@@ -1,0 +1,81 @@
+# @package _global_
+# Uniform-reward sanity check for categorical (sequential subset) trees.
+#
+# With R(tree) = 1 for every tree, trajectory balance gives Z = number of trees,
+# so the learned log Z must converge to log(number of trees). Any other value
+# means some trees are unreachable or reachable by several trajectories.
+#
+# Default setup: max_depth 1, n_categories [4, 3, 2] -> 2^(k-1) - 1 splits per
+# feature: 7 + 3 + 1 = 11 trees, so log Z -> log 11 = 2.398 (depth 2: 659 trees,
+# log 659 = 6.491). Count other setups with count_trees in
+# tests/gflownet/envs/test_tree_categorical.py.
+#
+#   python train.py +experiments=tree/categorical_uniform_tree
+
+defaults:
+  - override /env: tree/tree
+  - override /gflownet: trajectorybalance
+  - override /loss: trajectorybalance
+  - override /proxy: uniform
+  - override /logger: wandb
+
+device: cpu
+
+# Environment
+env:
+  max_depth: 1
+  node_type: categorical_sequential
+  node_kwargs:
+    features: ["color", "size", "shape"]
+    n_categories: [4, 3, 2]
+
+# GFlowNet hyperparameters
+gflownet:
+  random_action_prob: 0.0
+  optimizer:
+    batch_size:
+      forward: 100
+      backward_replay: 0
+      backward_dataset: 0
+    lr: 0.001
+    z_dim: 16
+    lr_z_mult: 100
+    n_train_steps: 2000
+  replay_sampling: permutation
+  train_sampling: permutation
+
+# Policy
+policy:
+  forward:
+    type: mlp
+    n_hid: 128
+    n_layers: 2
+  backward:
+    type: mlp
+    n_hid: 128
+    n_layers: 2
+    shared_weights: False
+
+# Evaluator
+evaluator:
+  first_it: False
+  period: -1
+  checkpoints_period: 500
+
+# WandB
+logger:
+  lightweight: True
+  run_name: categorical_uniform
+  project_name: "dt-gfn_classification"
+  tags:
+    - gflownet
+    - tree
+    - categorical
+    - uniform
+  do:
+    online: False
+
+# Hydra
+hydra:
+  run:
+    dir: ${user.logdir.root}/tree/${oc.env:SLURM_JOB_ID,local}/${now:%Y-%m-%d_%H-%M-%S_%f}

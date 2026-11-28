@@ -70,7 +70,7 @@ def _route_samples_to_leaves(
             continue
         if k in splits:
             feature, threshold = splits[k]
-            to_left = X[indices, feature] <= threshold
+            to_left = env.goes_left(X[indices, feature], threshold, feature + 1)
             partitions.append((Tree.left_child_idx(k), indices[to_left]))
             partitions.append((Tree.right_child_idx(k), indices[~to_left]))
         else:

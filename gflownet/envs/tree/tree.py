@@ -53,6 +53,7 @@ from torchtyping import TensorType
 
 from gflownet.envs.base import GFlowNetEnv
 from gflownet.envs.composite.base import CompositeBase
+from gflownet.envs.tree.categorical_node import DecisionTreeNodeCategoricalSequential
 from gflownet.envs.tree.discrete_choice_node import DecisionTreeNodeDiscreteChoice
 from gflownet.envs.tree.discrete_node import DecisionTreeNodeDiscrete
 from gflownet.envs.tree.node import DecisionTreeNode
@@ -62,6 +63,7 @@ _NODE_CLASSES = {
     "continuous": DecisionTreeNode,
     "discrete": DecisionTreeNodeDiscrete,
     "discrete_choice": DecisionTreeNodeDiscreteChoice,
+    "categorical_sequential": DecisionTreeNodeCategoricalSequential, # handles categorical features with subset splits (x in L), L built one category at a time
 }
 
 
@@ -186,12 +188,9 @@ class Tree(CompositeBase):
             if self.y_test is not None:
                 self.y_test = self.y_test.astype(int)
 
+        # Categorical nodes need to know which columns hold category codes
+        is_categorical = getattr(_NODE_CLASSES.get(node_type), "is_categorical", False)
         if self.X_train is not None:
-            if scale_data:
-                self.scaler = MinMaxScaler().fit(self.X_train)
-                self.X_train = self.scaler.transform(self.X_train)
-                if self.X_test is not None:
-                    self.X_test = self.scaler.transform(self.X_test)
             # Derive features from dataset if not explicitly provided
             if "features" not in node_kwargs or node_kwargs["features"] == None:
                 n_features = self.X_train.shape[1]
@@ -199,6 +198,38 @@ class Tree(CompositeBase):
                     node_kwargs["features"] = list(self.feature_names)
                 else:
                     node_kwargs["features"] = [f"x{i}" for i in range(n_features)]
+            # Categorical columns (0-based): all of them for a categorical node,
+            # none otherwise
+            if is_categorical:
+                cat_columns = list(range(self.X_train.shape[1]))
+            else:
+                cat_columns = []
+            num_columns = [
+                j for j in range(self.X_train.shape[1]) if j not in cat_columns
+            ]
+            # Categorical columns hold integer codes: they are never scaled, only
+            # the numeric columns are min-max scaled
+            if scale_data and num_columns:
+                self.X_train = self.X_train.astype(float)
+                self.scaler = MinMaxScaler().fit(self.X_train[:, num_columns])
+                self.X_train[:, num_columns] = self.scaler.transform(
+                    self.X_train[:, num_columns]
+                )
+                if self.X_test is not None:
+                    self.X_test = self.X_test.astype(float)
+                    self.X_test[:, num_columns] = self.scaler.transform(
+                        self.X_test[:, num_columns]
+                    )
+            # Derive the number of categories per feature from the codes
+            # 0..k-1 present in the data, if not explicitly provided
+            if cat_columns and node_kwargs.get("n_categories") is None:
+                X_all = self.X_train
+                if self.X_test is not None:
+                    X_all = np.concatenate([self.X_train, self.X_test], axis=0)
+                node_kwargs["n_categories"] = [
+                    int(X_all[:, j].max()) + 1 if j in cat_columns else None
+                    for j in range(X_all.shape[1])
+                ]
 
         if "features" not in node_kwargs:
             raise ValueError(
@@ -310,6 +341,9 @@ class Tree(CompositeBase):
         training data identically iff the same number of sorted training
         values of that feature are <= each of them.
         """
+        # A categorical split ``x in L`` is identified by its bitmask alone
+        if self.is_categorical_feature(feature + 1):
+            return int(threshold)
         if self._sorted_feature_values is None:
             self._sorted_feature_values = [
                 np.sort(self.X_train[:, j]) for j in range(self.X_train.shape[1])
@@ -399,6 +433,12 @@ class Tree(CompositeBase):
                 if child < self.max_nodes and not self._node_exists(
                     child, state
                 ):  # Check if space available for child and child not exists yet
+                    # A categorical node needs a feature with >= 2 categories
+                    # left after its ancestors' splits
+                    if self.is_categorical and not self.node_env.can_split(
+                        self._get_available_categories(child, state)
+                    ):
+                        continue
                     leaves.append(child)
         return leaves
 
@@ -499,6 +539,65 @@ class Tree(CompositeBase):
 
         return (lower, upper)
 
+    def _get_available_categories(self, k: int, state: Dict) -> List[set]:
+        """
+        Computes, for every feature, the categories (0-based codes) that can
+        still reach node ``k`` given its ancestors' categorical splits. This is
+        the categorical counterpart of :py:meth:`_get_threshold_bounds`.
+
+        For each done ancestor sending the categories ``L`` of feature ``f`` to
+        the left (``L = {c}`` for one-vs-rest splits ``x[f] == c``):
+        - if ``k`` is in its left subtree, only ``L`` remains for ``f``;
+        - if ``k`` is in its right subtree, ``L`` is removed for ``f``.
+
+        Node ``k`` itself does not need to exist: only its ancestors are used.
+        """
+        available = [set(range(n)) for n in self.node_env.n_categories]
+        current = k
+        while current > 0:
+            parent = self.parent_idx(current)
+            if not self._node_is_done(parent, state):
+                raise RuntimeError(
+                    f"Node {k} has an undone parent, which should be impossible"
+                )
+            feature_idx = self.node_env.get_feature(state[parent])
+            left = self.node_env.get_split_categories(state[parent])
+            if feature_idx is not None and left is not None:
+                f = feature_idx - 1
+                if self._is_in_left_subtree(k, parent):
+                    available[f] &= left
+                else:
+                    available[f] -= left
+            current = parent
+        return available
+
+    @property
+    def is_categorical(self) -> bool:
+        """True if the nodes split on categorical features (``x in L``)."""
+        return getattr(self.node_env, "is_categorical", False)
+
+    def is_categorical_feature(self, feature_idx: int) -> bool:
+        """True if splits on ``feature_idx`` (1-based) are ``x in L``."""
+        return self.is_categorical
+
+    def goes_left(
+        self, values: npt.NDArray, split_value, feature_idx: Optional[int] = None
+    ) -> npt.NDArray:
+        """
+        Split rule shared by the env, the proxy and the evaluation code:
+        delegated to categorical nodes (``x in L``), ``x <= t``
+        otherwise. ``feature_idx`` (1-based) is unused by these rules.
+        """
+        if self.is_categorical:
+            return self.node_env.goes_left(values, split_value)
+        return values <= split_value
+
+    def format_split(self, split_value, feature_idx: int) -> str:
+        """Text of a split for plots, e.g. ``"<= 0.30"`` or ``"in {0,2}"``."""
+        if self.is_categorical:
+            return self.node_env.format_split(split_value)
+        return f"<= {split_value:.2f}"
+
     def _node_apply_rescale(self, k: int, state: Dict) -> None:
         """
         Asks the node sub-environment to rescale the threshold of done node
@@ -555,8 +654,13 @@ class Tree(CompositeBase):
             and self._node_exists(active, state)
             and not self._node_is_done(active, state)
         ):
-            lower, upper = self._get_threshold_bounds(active, state)
-            self.node_env.set_threshold_bounds(lower, upper)
+            if self.is_categorical:
+                self.node_env.set_available_categories(
+                    self._get_available_categories(active, state)
+                )
+            else:
+                lower, upper = self._get_threshold_bounds(active, state)
+                self.node_env.set_threshold_bounds(lower, upper)
         else:
             self.node_env.clear_threshold_bounds()
         return True
@@ -1430,8 +1534,10 @@ class Tree(CompositeBase):
                 fname = str(self.node_env.features[feature_idx - 1])
             else:
                 fname = "?"
-            tval = f"{threshold:.2f}" if threshold is not None else "?"
-            labels[k] = f"{fname}\n<= {tval}"
+            rule = "<= ?"
+            if feature_idx is not None and threshold is not None:
+                rule = self.format_split(threshold, feature_idx)
+            labels[k] = f"{fname}\n{rule}"
             node_colors[k] = internal_color
 
         # Add the active (building) node if any
@@ -1444,8 +1550,10 @@ class Tree(CompositeBase):
             fname = "?"
             if feature_idx is not None:
                 fname = str(self.node_env.features[feature_idx - 1])
-            tval = f"{threshold:.2f}" if threshold is not None else "?"
-            labels[active] = f"{fname}\n<= {tval}\n(building)"
+            rule = "<= ?"
+            if feature_idx is not None and threshold is not None:
+                rule = self.format_split(threshold, feature_idx)
+            labels[active] = f"{fname}\n{rule}\n(building)"
             node_colors[active] = building_color
 
         # Add leaf placeholders (children of done nodes that don't exist)
@@ -1574,7 +1682,7 @@ class Tree(CompositeBase):
                 if feature_idx is None or threshold is None:
                     break
                 # feature_idx is 1-based (0 is reserved by the Choice env)
-                if x[feature_idx - 1] <= threshold:
+                if self.goes_left(x[feature_idx - 1], threshold, feature_idx):
                     k = self.left_child_idx(k)
                 else:
                     k = self.right_child_idx(k)
